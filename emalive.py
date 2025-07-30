@@ -311,7 +311,6 @@ def is_market_open():
 
 # ====== Main Live Trading Loop ======
 def live_trading():
-    # kite = get_kite_client()
     open_trade = load_open_position()
     
     if open_trade:
@@ -326,7 +325,6 @@ def live_trading():
         print("ℹ️ No open position. Waiting for next signal...")
         logging.info("ℹ️ No open position. Waiting for next signal...")
 
-    # Show market status
     if not is_market_open():
         print("🕒 PMK 5 Market is currently closed. Live trading will start once the market opens.")
         send_telegram_message("🕒 PMK 5 Market is currently closed. Live trading will start once the market opens.")
@@ -334,11 +332,10 @@ def live_trading():
     while True:
         try:
             if not is_market_open():
-                print("⏳PMK 5  Waiting for market to open...")
+                print("⏳ PMK 5  Waiting for market to open...")
                 time.sleep(60)
                 continue
 
-            # ----- Fetch Historical Data -----
             df = get_historical_df(instrument_token, INTERVAL, DAYS)
             print(f"🕵️‍♀️ PMK 5 Candles available: {len(df)} / Required: {REQUIRED_CANDLES}")
 
@@ -347,7 +344,6 @@ def live_trading():
                 time.sleep(60)
                 continue
 
-            # ----- Generate Signal -----
             df = generate_signals(df)
             latest = df.iloc[-1]
             ts = latest['date'].strftime('%Y-%m-%d %H:%M')
@@ -356,8 +352,7 @@ def live_trading():
             logging.info(f"{ts} | Close: {close} | Buy: {latest['buySignal']} | Sell: {latest['sellSignal']}")
             print(f"{ts} | Close: {close} | Buy: {latest['buySignal']} | Sell: {latest['sellSignal']}")
 
-            # ----- Trade Logic -----
-            # ✅ Exit previous position
+            # ✅ Exit previous SELL and enter BUY
             if latest['buySignal'] and position != "BUY":
                 if position == "SELL":
                     trade.update({
@@ -371,21 +366,22 @@ def live_trading():
                     delete_open_position(trade["OptionSymbol"])
                     send_telegram_message(f"📤 PMK 5 Exit SELL\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
 
-                # Enter new BUY position
                 opt_symbol, strike, expiry, ltp = get_optimal_option("BUY", close, NEAREST_LTP)
-                # opt_symbol, strike, expiry, ltp = get_option_symbol("BUY", close)
+                avg_price, qty = get_avgprice_from_positions(opt_symbol)
+                if avg_price is None:
+                    avg_price = ltp
+                    qty = QTY
 
-                option_price = ltp
-                # place_option_order(opt_symbol, QTY, "SELL")
-
+                # place_option_order(opt_symbol, qty, "SELL")
                 trade = {
                     "Signal": "BUY", "SpotEntry": close, "OptionSymbol": opt_symbol,
-                    "Strike": strike, "Expiry": expiry, "OptionSellPrice": option_price, "EntryTime": ts
+                    "Strike": strike, "Expiry": expiry, "OptionSellPrice": avg_price, "EntryTime": ts
                 }
                 save_open_position(trade)
                 position = "BUY"
-                send_telegram_message(f"🟢 PMK 5 Buy Signal\n{opt_symbol} | LTP ₹{option_price:.2f}")
+                send_telegram_message(f"🟢 PMK 5 Buy Signal\n{opt_symbol} | LTP ₹{avg_price:.2f}")
 
+            # ✅ Exit previous BUY and enter SELL
             elif latest['sellSignal'] and position != "SELL":
                 if position == "BUY":
                     trade.update({
@@ -395,24 +391,24 @@ def live_trading():
                     })
                     trade["PnL"] = trade["OptionSellPrice"] - trade["OptionBuyPrice"]
                     # place_option_order(trade["OptionSymbol"], QTY, "BUY")
-                    
                     record_trade(trade)
                     delete_open_position(trade["OptionSymbol"])
                     send_telegram_message(f"📤 PMK 5 Exit BUY\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
 
-                # Enter new SELL position
                 opt_symbol, strike, expiry, ltp = get_optimal_option("SELL", close, NEAREST_LTP)
-                # opt_symbol, strike, expiry, ltp = get_option_symbol("SELL", close)
+                avg_price, qty = get_avgprice_from_positions(opt_symbol)
+                if avg_price is None:
+                    avg_price = ltp
+                    qty = QTY
 
-                option_price = ltp
-                # place_option_order(opt_symbol, QTY, "SELL")
+                # place_option_order(opt_symbol, qty, "SELL")
                 trade = {
                     "Signal": "SELL", "SpotEntry": close, "OptionSymbol": opt_symbol,
-                    "Strike": strike, "Expiry": expiry, "OptionSellPrice": option_price, "EntryTime": ts
+                    "Strike": strike, "Expiry": expiry, "OptionSellPrice": avg_price, "EntryTime": ts
                 }
                 save_open_position(trade)
                 position = "SELL"
-                send_telegram_message(f"🔴 PMK 5 Sell Signal\n{opt_symbol} | LTP ₹{option_price:.2f}")
+                send_telegram_message(f"🔴 PMK 5 Sell Signal\n{opt_symbol} | LTP ₹{avg_price:.2f}")
 
             wait_until_next_candle()
 
@@ -420,6 +416,7 @@ def live_trading():
             logging.error(f"Exception: {e}", exc_info=True)
             send_telegram_message(f"⚠️ PMK 5 Error: {e}")
             time.sleep(60)
+
 
 # ====== Run ======
 if __name__ == "__main__":
