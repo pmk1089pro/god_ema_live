@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import sqlite3
 import logging
-from config import SYMBOL, INTERVAL,NEAREST_LTP, CANDLE_DAYS as DAYS, REQUIRED_CANDLES, QTY, DB_FILE, LOG_FILE
+from config import SYMBOL,SEGMENT, INTERVAL,NEAREST_LTP, CANDLE_DAYS as DAYS, REQUIRED_CANDLES, QTY, DB_FILE, LOG_FILE
 from kitefunction import get_historical_df, get_ltp_from_positions, place_option_order, get_token_for_symbol, get_kite_client,get_quotes,get_avgprice_from_positions
 from telegrambot import send_telegram_message
 
@@ -20,6 +20,17 @@ logging.basicConfig(
 )
 
 instrument_token = get_token_for_symbol(SYMBOL)
+
+def log_instruments_file_mod_time(filename="instruments.csv"):
+    import os
+    import time
+    try:
+        mod_time = time.ctime(os.path.getmtime(filename))
+        print(f"ℹ️ {filename} last modified: {mod_time}")
+        logging.info(f"ℹ️ {filename} last modified: {mod_time}")
+    except Exception as e:
+        print(f"❌ Failed to get modification time of {filename}: {e}")
+        logging.error(f"❌ Failed to get modification time of {filename}: {e}")
 
 # ====== DB Setup ======
 def init_db():
@@ -40,7 +51,7 @@ def init_db():
             option_buy_price REAL,
             exit_time TEXT,
             pnl REAL,
-            qty REAL
+            qty INTEGER
         )
     """)
     c.execute("""
@@ -53,7 +64,7 @@ def init_db():
             expiry TEXT,
             option_sell_price REAL,
             entry_time TEXT,
-            qty REAL
+            qty INTEGER
         )
     """)
     conn.commit()
@@ -128,9 +139,9 @@ def wait_until_next_candle():
     wait_sec = (gap - (now.minute % gap)) * 60 - now.second + 2
     time.sleep(max(2, wait_sec))
 
-def get_option_symbol(signal, spot):
-    df = pd.read_csv("instruments.csv")
-    
+def get_option_symbol(signal, spot,instruments_df):
+    # df = pd.read_csv("instruments.csv")
+    df = instruments_df.copy()
     # Calculate strike based on signal
     strike = int(round(spot / 100.0) * 100) + (-600 if signal == "BUY" else 600)
     opt_type = "PE" if signal == "BUY" else "CE"
@@ -138,7 +149,7 @@ def get_option_symbol(signal, spot):
     # Filter for relevant option contracts
     df = df[
         (df['name'] == SYMBOL) &
-        (df['segment'] == 'NFO-OPT') &
+        (df['segment'] == SEGMENT) &
         (df['strike'] == strike) &
         (df['tradingsymbol'].str.endswith(opt_type))
     ].copy()
@@ -173,11 +184,12 @@ def get_option_symbol(signal, spot):
 
     return option['tradingsymbol'], strike, option['expiry'].strftime('%Y-%m-%d'), ltp
 
-def get_optimal_option(signal, spot, nearest_price):
+def get_optimal_option(signal, spot, nearest_price,instruments_df):
     strike = int(round(spot / 100.0) * 100)
     print(f"Signal: {signal}, Spot: {spot}, Nearest 100 Strike: {strike}")
 
-    df = pd.read_csv("instruments.csv")
+    # df = pd.read_csv("instruments.csv")
+    df = instruments_df.copy()
 
     best_option = None
     best_ltp_diff = float('inf')
@@ -193,8 +205,8 @@ def get_optimal_option(signal, spot, nearest_price):
 
         # Filter instruments for symbol, segment, strike, and option type
         df_filtered = df[
-            (df['name'] == 'NIFTY') &
-            (df['segment'] == 'NFO-OPT') &
+            (df['name'] == SYMBOL) &
+            (df['segment'] == SEGMENT) &
             (df['strike'] == strike) &
             (df['tradingsymbol'].str.endswith(opt_type))
         ].copy()
@@ -305,7 +317,7 @@ def record_trade(trade):
     conn.close()
     print(f"📊 Trade recorded in DB.")
 
-def get_next_expiry_optimal_option(signal, last_expiry, price, nearest_price):
+def get_next_expiry_optimal_option(signal, last_expiry, price, nearest_price,instruments_df):
     """
     Get the next expiry option after last_expiry with nearest strike to price
     and closest LTP to nearest_price.
@@ -320,7 +332,8 @@ def get_next_expiry_optimal_option(signal, last_expiry, price, nearest_price):
         tuple: (option_symbol, strike, expiry, ltp) or (None, None, None, None) if not found
     """
     try:
-        df = pd.read_csv("instruments.csv")
+        # df = pd.read_csv("instruments.csv")
+        df = instruments_df.copy()
         
         # Calculate base strike (nearest hundred)
         base_strike = int(round(price / 100.0) * 100)
@@ -350,7 +363,7 @@ def get_next_expiry_optimal_option(signal, last_expiry, price, nearest_price):
             # Filter for relevant option contracts
             df_filtered = df[
                 (df['name'] == SYMBOL) &
-                (df['segment'] == 'NFO-OPT') &
+                (df['segment'] == SEGMENT) &
                 (df['strike'] == strike) &
                 (df['tradingsymbol'].str.endswith(opt_type))
             ].copy()
@@ -447,7 +460,7 @@ def is_market_open():
     # return True  # For testing purposes, assume market is always open
 
 # ====== Main Live Trading Loop ======
-def live_trading():
+def live_trading(instruments_df):
     # kite = get_kite_client()
     open_trade = load_open_position()
 
@@ -506,7 +519,7 @@ def live_trading():
                     send_telegram_message(f"📤 PMK {INTERVAL} Exit SELL\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
 
                 # opt_symbol, strike, expiry, ltp = get_optimal_option("BUY", close, NEAREST_LTP)
-                result = get_optimal_option("BUY", close, NEAREST_LTP)
+                result = get_optimal_option("BUY", close, NEAREST_LTP,instruments_df)
                 if result is None or result[0] is None:
                     # Handle: No suitable option
                     logging.error(f"❌ PMK {INTERVAL}: No suitable option found for BUY signal.")
@@ -550,7 +563,7 @@ def live_trading():
                     send_telegram_message(f"📤 PMK {INTERVAL} Exit BUY\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
 
                 # opt_symbol, strike, expiry, ltp = get_optimal_option("SELL", close, NEAREST_LTP)
-                    result = get_optimal_option("SELL", close, NEAREST_LTP)
+                    result = get_optimal_option("SELL", close, NEAREST_LTP,instruments_df)
                     if result is None or result[0] is None:
                         # Handle: No suitable option
                         logging.error(f"❌ PMK {INTERVAL}: No suitable option found for SELL signal.")
@@ -596,7 +609,7 @@ def live_trading():
                     trade = {}
 
                     # opt_symbol, strike, expiry, ltp = get_next_expiry_optimal_option(signal, last_expiry, close, NEAREST_LTP)
-                    result = get_next_expiry_optimal_option(signal, last_expiry, close, NEAREST_LTP)
+                    result = get_next_expiry_optimal_option(signal, last_expiry, close, NEAREST_LTP,instruments_df)
                     if result is None or result[0] is None:
                         logging.error(f"❌ No expiry found after {last_expiry} for reentry.")
                         position = None
@@ -640,8 +653,11 @@ def live_trading():
 # ====== Run ======
 if __name__ == "__main__":
     init_db()
+    # Load instruments once
+    instruments_df = pd.read_csv("instruments.csv")
+    log_instruments_file_mod_time()
     send_telegram_message(f"🚀 PMK {INTERVAL} Live trading started!")
-    live_trading()
+    live_trading(instruments_df)
     # SPOT = 24870
     # print(get_optimal_option("BUY", SPOT, NEAREST_LTP))
     # print(get_avgprice_from_positions("NIFTY2581424200PE"))

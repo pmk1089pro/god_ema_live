@@ -8,9 +8,6 @@ from config import ACCESS_TOKEN_FILE, INSTRUMENTS_FILE
 # Load instruments.csv
 instruments_df = pd.read_csv(INSTRUMENTS_FILE)
 
-
-
-
 def get_kite_client():
     try:
         with open(ACCESS_TOKEN_FILE, "r") as f:
