@@ -39,7 +39,8 @@ def init_db():
             spot_exit REAL,
             option_buy_price REAL,
             exit_time TEXT,
-            pnl REAL
+            pnl REAL,
+            qty REAL
         )
     """)
     c.execute("""
@@ -51,7 +52,8 @@ def init_db():
             strike INTEGER,
             expiry TEXT,
             option_sell_price REAL,
-            entry_time TEXT
+            entry_time TEXT,
+            qty REAL
         )
     """)
     conn.commit()
@@ -249,11 +251,11 @@ def save_open_position(trade):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO open_positions (signal, spot_entry, option_symbol, strike, expiry, option_sell_price, entry_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO open_positions (signal, spot_entry, option_symbol, strike, expiry, option_sell_price, entry_time,qty)
+        VALUES (?, ?, ?, ?, ?, ?, ?,?)
     """, (
         trade["Signal"], trade["SpotEntry"], trade["OptionSymbol"], trade["Strike"],
-        trade["Expiry"], trade["OptionSellPrice"], trade["EntryTime"]
+        trade["Expiry"], trade["OptionSellPrice"], trade["EntryTime"],trade["qty"]
     ))
     conn.commit()
     conn.close()
@@ -268,7 +270,7 @@ def delete_open_position(symbol):
 def load_open_position():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT signal, spot_entry, option_symbol, strike, expiry, option_sell_price, entry_time FROM open_positions ORDER BY id DESC LIMIT 1")
+    c.execute("SELECT signal, spot_entry, option_symbol, strike, expiry, option_sell_price, entry_time,qty FROM open_positions ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
     if row:
@@ -279,7 +281,8 @@ def load_open_position():
             "Strike": row[3],
             "Expiry": row[4],
             "OptionSellPrice": row[5],
-            "EntryTime": row[6]
+            "EntryTime": row[6],
+            "qty": row[7] 
         }
     return None
 
@@ -291,17 +294,151 @@ def record_trade(trade):
     c = conn.cursor()
     c.execute("""
         INSERT INTO live_trades (signal, spot_entry, option_symbol, strike, expiry, option_sell_price,
-        entry_time, spot_exit, option_buy_price, exit_time, pnl)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        entry_time, spot_exit, option_buy_price, exit_time, pnl,qty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?)
     """, (
         trade["Signal"], trade["SpotEntry"], trade["OptionSymbol"], trade["Strike"],
         trade["Expiry"], trade["OptionSellPrice"], trade["EntryTime"],
-        trade["SpotExit"], trade["OptionBuyPrice"], trade["ExitTime"], trade["PnL"]
+        trade["SpotExit"], trade["OptionBuyPrice"], trade["ExitTime"], trade["PnL"],trade["qty"]
     ))
     conn.commit()
     conn.close()
     print(f"📊 Trade recorded in DB.")
 
+def get_next_expiry_optimal_option(signal, last_expiry, price, nearest_price):
+    """
+    Get the next expiry option after last_expiry with nearest strike to price
+    and closest LTP to nearest_price.
+    
+    Args:
+        signal (str): "BUY" or "SELL"
+        last_expiry (str): Last expiry date in 'YYYY-MM-DD' format
+        price (float): Current spot price
+        nearest_price (float): Target LTP to match
+    
+    Returns:
+        tuple: (option_symbol, strike, expiry, ltp) or (None, None, None, None) if not found
+    """
+    try:
+        df = pd.read_csv("instruments.csv")
+        
+        # Calculate base strike (nearest hundred)
+        base_strike = int(round(price / 100.0) * 100)
+        
+        # Determine option type based on signal
+        opt_type = "PE" if signal == "BUY" else "CE"
+        
+        # Parse last expiry date
+        last_expiry_date = pd.to_datetime(last_expiry)
+        
+        # Initialize strike adjustment
+        if signal == "BUY":
+            strike = base_strike - 100
+            strike_adjustment = -100
+        else:  # SELL
+            strike = base_strike + 100
+            strike_adjustment = 100
+        
+        best_option = None
+        best_ltp_diff = float('inf')
+        previous_strike = None
+        previous_ltp = None
+        
+        while True:
+            #print(f"🔍 Checking strike {strike}{opt_type} for signal {signal}")
+            
+            # Filter for relevant option contracts
+            df_filtered = df[
+                (df['name'] == SYMBOL) &
+                (df['segment'] == 'NFO-OPT') &
+                (df['strike'] == strike) &
+                (df['tradingsymbol'].str.endswith(opt_type))
+            ].copy()
+            
+            if df_filtered.empty:
+                #print(f"⚠️ No options found for strike {strike}{opt_type}")
+                break
+            
+            # Parse expiry dates
+            df_filtered['expiry'] = pd.to_datetime(df_filtered['expiry'])
+            
+            # Filter for expiries after the last expiry
+            df_next_expiry = df_filtered[df_filtered['expiry'] > last_expiry_date].copy()
+            
+            if df_next_expiry.empty:
+                #print(f"❌ No expiries found after {last_expiry} for strike {strike}{opt_type}")
+                break
+            
+            # Sort by expiry date to get the next available expiry
+            df_next_expiry = df_next_expiry.sort_values('expiry')
+            
+            # Get the next expiry date
+            next_expiry = df_next_expiry.iloc[0]['expiry']
+            
+            # Filter options for this specific expiry
+            df_same_expiry = df_next_expiry[df_next_expiry['expiry'] == next_expiry].copy()
+            
+            if df_same_expiry.empty:
+                #print(f"❌ No options found for expiry {next_expiry} at strike {strike}{opt_type}")
+                break
+            
+            # Get LTP for this strike
+            option = df_same_expiry.iloc[0]
+            opt_symbol = option['tradingsymbol']
+            ltp = get_quotes(opt_symbol) or 0.0
+            
+            #print(f"📊 Strike {strike}{opt_type}: LTP = ₹{ltp:.2f}")
+            
+            # Check if LTP is greater than 40
+            if ltp > 40:
+                #print(f"⚠️ LTP ₹{ltp:.2f} > 40, adjusting strike by {strike_adjustment}")
+                previous_strike = strike
+                previous_ltp = ltp
+                previous_symbol = opt_symbol
+                strike += strike_adjustment
+                continue
+            
+            # LTP is <= 40, now compare with previous strike if available
+            if previous_strike is not None and previous_ltp is not None:
+                #print(f"🔄 Comparing strikes: {previous_strike}(₹{previous_ltp:.2f}) vs {strike}(₹{ltp:.2f})")
+                
+                # Calculate which strike is closer to nearest_price
+                prev_diff = abs(previous_ltp - nearest_price)
+                curr_diff = abs(ltp - nearest_price)
+                
+                if prev_diff <= curr_diff:
+                    # Previous strike is better
+                    best_strike = previous_strike
+                    best_ltp = previous_ltp
+                    best_symbol = previous_symbol
+                    #print(f"✅ Selected previous strike {previous_strike} with LTP ₹{previous_ltp:.2f}")
+                else:
+                    # Current strike is better
+                    best_strike = strike
+                    best_ltp = ltp
+                    best_symbol = opt_symbol
+                    #print(f"✅ Selected current strike {strike} with LTP ₹{ltp:.2f}")
+            else:
+                # No previous strike to compare, use current
+                best_strike = strike
+                best_ltp = ltp
+                best_symbol = opt_symbol
+                #print(f"✅ Selected strike {strike} with LTP ₹{ltp:.2f}")
+            
+            # Get the expiry date for the selected option
+            
+            best_expiry = next_expiry.strftime('%Y-%m-%d')
+            
+            return best_symbol, best_strike, best_expiry, best_ltp
+        
+        # If we reach here, no suitable option found
+        print(f"❌ No suitable option found for signal {signal} after {last_expiry}")
+        return None, None, None, None
+            
+    except Exception as e:
+        print(f"❌ Error in get_next_expiry_optimal_option: {e}")
+        logging.error(f"Error in get_next_expiry_optimal_option: {e}")
+        return None, None, None, None
 
 # ====== Market Hours ======
 def is_market_open():
@@ -311,36 +448,37 @@ def is_market_open():
 
 # ====== Main Live Trading Loop ======
 def live_trading():
+    # kite = get_kite_client()
     open_trade = load_open_position()
-    
+
     if open_trade:
         trade = open_trade
         position = open_trade["Signal"]
-        logging.info(f"📌 Resumed open position: {position} | {open_trade['OptionSymbol']} @ ₹{open_trade['OptionSellPrice']}")
-        print(f"➡️ Loaded open position: {open_trade}")
-        send_telegram_message(f"📌 PMK 5 Resumed open position: {position} | {open_trade['OptionSymbol']} @ ₹{open_trade['OptionSellPrice']}")
+        logging.info(f"📌 PMK {INTERVAL} Resumed open position: {position} | {open_trade['OptionSymbol']} @ ₹{open_trade['OptionSellPrice']}| Qty: {open_trade['qty']}")
+        print(f"➡️ PMK {INTERVAL} Loaded open position: {open_trade}")
+        send_telegram_message(f"📌 PMK {INTERVAL} Resumed open position: {position} | {open_trade['OptionSymbol']} @ ₹{open_trade['OptionSellPrice']}| Qty: {open_trade['qty']}")
     else:
         trade = {}
         position = None
-        print("ℹ️ No open position. Waiting for next signal...")
-        logging.info("ℹ️ No open position. Waiting for next signal...")
+        print("ℹ️ PMK 5 No open position. Waiting for next signal...")
+        logging.info("ℹ️ PMK 5 No open position. Waiting for next signal...")
 
     if not is_market_open():
-        print("🕒 PMK 5 Market is currently closed. Live trading will start once the market opens.")
-        send_telegram_message("🕒 PMK 5 Market is currently closed. Live trading will start once the market opens.")
+        print(f"🕒 PMK  {INTERVAL} Market is currently closed. Live trading will start once the market opens.")
+        send_telegram_message(f"🕒 PMK {INTERVAL} Market is currently closed. Live trading will start once the market opens.")
 
     while True:
         try:
             if not is_market_open():
-                print("⏳ PMK 5  Waiting for market to open...")
+                print(f"PMK {INTERVAL}  Waiting for market to open...")
                 time.sleep(60)
                 continue
 
             df = get_historical_df(instrument_token, INTERVAL, DAYS)
-            print(f"🕵️‍♀️ PMK 5 Candles available: {len(df)} / Required: {REQUIRED_CANDLES}")
+            print(f"🕵️‍♀️ PMK {INTERVAL}  Candles available: {len(df)} / Required: {REQUIRED_CANDLES}")
 
             if len(df) < REQUIRED_CANDLES:
-                print("⚠️ PMK 5 Not enough candles. Waiting...")
+                print(f"⚠️ PMK {INTERVAL} Not enough candles. Waiting...")
                 time.sleep(60)
                 continue
 
@@ -352,7 +490,7 @@ def live_trading():
             logging.info(f"{ts} | Close: {close} | Buy: {latest['buySignal']} | Sell: {latest['sellSignal']}")
             print(f"{ts} | Close: {close} | Buy: {latest['buySignal']} | Sell: {latest['sellSignal']}")
 
-            # ✅ Exit previous SELL and enter BUY
+            # ✅ Exit and Enter BUY
             if latest['buySignal'] and position != "BUY":
                 if position == "SELL":
                     trade.update({
@@ -361,27 +499,40 @@ def live_trading():
                         "OptionBuyPrice": get_quotes(trade["OptionSymbol"]),
                     })
                     trade["PnL"] = trade["OptionSellPrice"] - trade["OptionBuyPrice"]
-                    # place_option_order(trade["OptionSymbol"], QTY, "BUY")
+                    # place_option_order(trade["OptionSymbol"], trade["qty"], "BUY")
                     record_trade(trade)
                     delete_open_position(trade["OptionSymbol"])
-                    send_telegram_message(f"📤 PMK 5 Exit SELL\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
+                    send_telegram_message(f"📤 PMK {INTERVAL} Exit SELL\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
 
-                opt_symbol, strike, expiry, ltp = get_optimal_option("BUY", close, NEAREST_LTP)
+                # opt_symbol, strike, expiry, ltp = get_optimal_option("BUY", close, NEAREST_LTP)
+                result = get_optimal_option("BUY", close, NEAREST_LTP)
+                if result is None or result[0] is None:
+                    # Handle: No suitable option
+                    logging.error(f"❌ PMK {INTERVAL}: No suitable option found for BUY signal.")
+                    send_telegram_message(f"❌ PMK {INTERVAL}: No suitable option found for BUY signal.")
+                    # Maybe continue or break
+                    continue
+                else:
+                    opt_symbol, strike, expiry, ltp = result
+                # place_option_order(opt_symbol, qty, "SELL")
+                time.sleep(2)  # Allow order to execute
+
                 avg_price, qty = get_avgprice_from_positions(opt_symbol)
                 if avg_price is None:
                     avg_price = ltp
                     qty = QTY
 
-                # place_option_order(opt_symbol, qty, "SELL")
                 trade = {
                     "Signal": "BUY", "SpotEntry": close, "OptionSymbol": opt_symbol,
-                    "Strike": strike, "Expiry": expiry, "OptionSellPrice": avg_price, "EntryTime": ts
+                    "Strike": strike, "Expiry": expiry,
+                    "OptionSellPrice": avg_price, "EntryTime": ts,
+                    "qty": qty
                 }
                 save_open_position(trade)
                 position = "BUY"
-                send_telegram_message(f"🟢 PMK 5 Buy Signal\n{opt_symbol} | LTP ₹{avg_price:.2f}")
+                send_telegram_message(f"🟢 PMK {INTERVAL} Buy Signal\n{opt_symbol} | Avg ₹{avg_price:.2f} | Qty: {qty}")
 
-            # ✅ Exit previous BUY and enter SELL
+            # ✅ Exit and Enter SELL
             elif latest['sellSignal'] and position != "SELL":
                 if position == "BUY":
                     trade.update({
@@ -390,42 +541,108 @@ def live_trading():
                         "OptionBuyPrice": get_quotes(trade["OptionSymbol"]),
                     })
                     trade["PnL"] = trade["OptionSellPrice"] - trade["OptionBuyPrice"]
-                    # place_option_order(trade["OptionSymbol"], QTY, "BUY")
+                    trade["qty"] = trade.get("qty", QTY)
+
+                    # place_option_order(trade["OptionSymbol"], trade["qty"], "BUY")
                     record_trade(trade)
                     delete_open_position(trade["OptionSymbol"])
-                    send_telegram_message(f"📤 PMK 5 Exit BUY\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
+                    send_telegram_message(f"📤 PMK {INTERVAL} Exit BUY\n{trade['OptionSymbol']} @ ₹{trade['OptionBuyPrice']:.2f}")
 
-                opt_symbol, strike, expiry, ltp = get_optimal_option("SELL", close, NEAREST_LTP)
+                # opt_symbol, strike, expiry, ltp = get_optimal_option("SELL", close, NEAREST_LTP)
+                    result = get_optimal_option("SELL", close, NEAREST_LTP)
+                    if result is None or result[0] is None:
+                        # Handle: No suitable option
+                        logging.error(f"❌ PMK {INTERVAL}: No suitable option found for SELL signal.")
+                        send_telegram_message(f"❌ PMK {INTERVAL}: No suitable option found for SELL signal.")
+                        # Maybe continue or break
+                        continue
+                    else:
+                        opt_symbol, strike, expiry, ltp = result
+                    # place_option_order(opt_symbol, QTY, "SELL")
+                    time.sleep(2)
+
                 avg_price, qty = get_avgprice_from_positions(opt_symbol)
                 if avg_price is None:
                     avg_price = ltp
                     qty = QTY
 
-                # place_option_order(opt_symbol, qty, "SELL")
                 trade = {
                     "Signal": "SELL", "SpotEntry": close, "OptionSymbol": opt_symbol,
-                    "Strike": strike, "Expiry": expiry, "OptionSellPrice": avg_price, "EntryTime": ts
+                    "Strike": strike, "Expiry": expiry,
+                    "OptionSellPrice": avg_price, "EntryTime": ts,
+                    "qty": qty
                 }
                 save_open_position(trade)
                 position = "SELL"
-                send_telegram_message(f"🔴 PMK 5 Sell Signal\n{opt_symbol} | LTP ₹{avg_price:.2f}")
+                send_telegram_message(f"🔴 PMK {INTERVAL} Sell Signal\n{opt_symbol} | Avg ₹{avg_price:.2f} | Qty: {qty}")
+
+            # ✅ Monitor Open Position for Target Exit
+            elif trade and "OptionSymbol" in trade and "OptionSellPrice" in trade:
+                current_ltp = get_quotes(trade["OptionSymbol"])
+                entry_ltp = trade["OptionSellPrice"]
+
+                if entry_ltp != 0.0 and current_ltp <= 0.6 * entry_ltp:
+                    trade["SpotExit"] = close
+                    trade["ExitTime"] = ts
+                    trade["OptionBuyPrice"] = current_ltp
+                    trade["PnL"] = entry_ltp - current_ltp
+                    record_trade(trade)
+                    delete_open_position(trade["OptionSymbol"])
+                    send_telegram_message(f"📤 PMK {INTERVAL} Exit {trade['Signal']}\n{trade['OptionSymbol']} @ ₹{current_ltp:.2f}")
+                    logging.info(f"🔴 PMK {INTERVAL} Target triggered for {trade['OptionSymbol']} at ₹{current_ltp:.2f}")
+                    last_expiry = trade["Expiry"]
+                    signal = trade["Signal"]
+                    trade = {}
+
+                    # opt_symbol, strike, expiry, ltp = get_next_expiry_optimal_option(signal, last_expiry, close, NEAREST_LTP)
+                    result = get_next_expiry_optimal_option(signal, last_expiry, close, NEAREST_LTP)
+                    if result is None or result[0] is None:
+                        logging.error(f"❌ No expiry found after {last_expiry} for reentry.")
+                        position = None
+                        continue
+                    else:
+                        opt_symbol, strike, expiry, ltp = result
+                    # place_option_order(opt_symbol, QTY, "SELL")
+                    time.sleep(2)
+
+                    avg_price, qty = get_avgprice_from_positions(opt_symbol)
+                    if avg_price is None:
+                        avg_price = ltp
+                        qty = QTY
+
+                    if opt_symbol:
+                        trade = {
+                            "Signal": signal,
+                            "SpotEntry": close,
+                            "OptionSymbol": opt_symbol,
+                            "Strike": strike,
+                            "Expiry": expiry,
+                            "OptionSellPrice": avg_price,
+                            "EntryTime": ts,
+                            "qty": qty
+                        }
+                        save_open_position(trade)
+                        send_telegram_message(f"🔁 PMK {INTERVAL} Reentry {signal}\n{opt_symbol} | Avg ₹{avg_price:.2f} | Qty: {qty}")
+                        position = signal
+                    else:
+                        logging.info(f"❌ No expiry found after {last_expiry} for reentry.")
+                        position = None
 
             wait_until_next_candle()
 
         except Exception as e:
             logging.error(f"Exception: {e}", exc_info=True)
-            send_telegram_message(f"⚠️ PMK 5 Error: {e}")
+            send_telegram_message(f"⚠️ PMK {INTERVAL} Error: {e}")
             time.sleep(60)
 
 
 # ====== Run ======
 if __name__ == "__main__":
     init_db()
-    send_telegram_message("🚀 PMK 5 Live trading started!")
-    # SPOT = 24719
-    # opt_sym = get_optimal_option("BUY", SPOT,40) 
-    # print(opt_sym)
-    # print(get_option_symbol("BUY", SPOT))
-    # avg_price,avg_qty = get_avgprice_from_positions("NIFTY25AUG23700PE")
-    # print(f"Avg Price: {avg_price}, Qty: {avg_qty}")
+    send_telegram_message(f"🚀 PMK {INTERVAL} Live trading started!")
     live_trading()
+    # SPOT = 24870
+    # print(get_optimal_option("BUY", SPOT, NEAREST_LTP))
+    # print(get_avgprice_from_positions("NIFTY2581424200PE"))
+    # avg_price, qty = get_avgprice_from_positions("NIFTY2581424200PE")
+    # print (avg_price, qty)

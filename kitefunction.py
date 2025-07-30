@@ -100,7 +100,7 @@ def get_avgprice_from_positions(tradingsymbol):
                 return avg_price, qty
     except Exception as e:
         print(f"⚠️ Error fetching LTP from positions: {e}")
-    return None
+    return None, 0
 
 def place_option_order(tradingsymbol, qty, ordertype):
     kite = get_kite_client()
