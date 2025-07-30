@@ -499,6 +499,7 @@ def live_trading():
                         "OptionBuyPrice": get_quotes(trade["OptionSymbol"]),
                     })
                     trade["PnL"] = trade["OptionSellPrice"] - trade["OptionBuyPrice"]
+                    trade["qty"] = trade.get("qty", QTY)
                     # place_option_order(trade["OptionSymbol"], trade["qty"], "BUY")
                     record_trade(trade)
                     delete_open_position(trade["OptionSymbol"])
